@@ -6,18 +6,18 @@
 # Other commands:
 #   codex-retry start|on   start the background daemon
 #   codex-retry stop|off   stop it
-#   codex-retry status     show status and recent log lines
+#   codex-retry status     self-check: daemon, permissions, app, recent log
 #   codex-retry log        follow the daemon log (Ctrl-C to quit)
 #   codex-retry sweep      process hidden failed sessions once, right now
 #   codex-retry threads    list known threads from the local app-server (debug)
-#   codex-retry doctor     self-check (permissions, app, windows, daemon)
 #   codex-retry restart
+#   codex-retry uninstall  stop and remove codex-retry
 #   codex-retry version
 #
 # Environment:
 #   CODEX_RETRY_LANG=en|zh            UI language (defaults to the system locale)
-#   CODEX_RETRY_IDLE=10               seconds of user idle before clicking background windows
-#   CODEX_RETRY_COOLDOWN=8            minimum seconds between clicks in the same window
+#   CODEX_RETRY_IDLE=10               idle seconds before acting while ChatGPT is frontmost
+#   CODEX_RETRY_COOLDOWN=8            minimum seconds between retries in the same window
 #   CODEX_RETRY_INTERVAL=2            scan interval in seconds
 #   CODEX_RETRY_SWEEP=0               disable retrying hidden sidebar sessions
 #   CODEX_RETRY_SWEEP_IDLE=15         idle seconds before a hidden-session sweep
@@ -64,18 +64,18 @@ codex-retry — ChatGPT / Codex 桌面端满载自动重试
   codex-retry            开关：没运行就启动；正在运行就停止
   codex-retry start      启动
   codex-retry stop       停止
-  codex-retry status     查看状态
+  codex-retry status     状态与自检（daemon / 权限 / ChatGPT / 日志）
   codex-retry log        跟踪日志（Ctrl-C 退出）
   codex-retry sweep      立即处理一次隐藏的满载会话（调试用）
   codex-retry threads    列出本地 app-server 的会话（调试用）
-  codex-retry doctor     自检（权限 / ChatGPT / 窗口 / daemon）
   codex-retry restart    重启
+  codex-retry uninstall  停止并卸载
   codex-retry version    版本
 
 环境变量：
   CODEX_RETRY_LANG=en|zh            界面语言（默认跟随系统）
-  CODEX_RETRY_IDLE=10               用户空闲多少秒后才点后台窗口
-  CODEX_RETRY_COOLDOWN=8            同一窗口两次点击的最小间隔秒数
+  CODEX_RETRY_IDLE=10               ChatGPT 在前台时，用户空闲多少秒后才动作
+  CODEX_RETRY_COOLDOWN=8            同一窗口两次重试的最小间隔秒数
   CODEX_RETRY_INTERVAL=2            扫描间隔秒数
   CODEX_RETRY_SWEEP=0               关闭「隐藏会话」自动重试
   CODEX_RETRY_SWEEP_IDLE=15         扫描隐藏会话前的空闲秒数
@@ -90,18 +90,18 @@ codex-retry — auto-retry "model is at capacity" in the ChatGPT/Codex desktop a
   codex-retry            toggle: start if stopped, stop if running
   codex-retry start      start the daemon
   codex-retry stop       stop the daemon
-  codex-retry status     show status
+  codex-retry status     status and self-check (daemon / permissions / app / log)
   codex-retry log        follow the log (Ctrl-C to quit)
   codex-retry sweep      process hidden failed sessions once (debug)
   codex-retry threads    list local app-server threads (debug)
-  codex-retry doctor     self-check (permissions / app / windows / daemon)
   codex-retry restart    restart
+  codex-retry uninstall  stop and remove codex-retry
   codex-retry version    print version
 
 Environment:
   CODEX_RETRY_LANG=en|zh            UI language (defaults to the system locale)
-  CODEX_RETRY_IDLE=10               idle seconds before clicking background windows
-  CODEX_RETRY_COOLDOWN=8            min seconds between clicks in one window
+  CODEX_RETRY_IDLE=10               idle seconds before acting while ChatGPT is frontmost
+  CODEX_RETRY_COOLDOWN=8            min seconds between retries in one window
   CODEX_RETRY_INTERVAL=2            scan interval in seconds
   CODEX_RETRY_SWEEP=0               disable retrying hidden sidebar sessions
   CODEX_RETRY_SWEEP_IDLE=15         idle seconds before a hidden-session sweep
@@ -113,17 +113,9 @@ EOF
 }
 
 # ---------- helpers ----------
-daemon_pids() {
-  ps -axo pid=,command= 2>/dev/null | grep -E '[r]etry_daemon( --|$)' | awk '{print $1}'
-}
+daemon_pids() { pgrep -x retry_daemon 2>/dev/null; }
 
 permission_ok() { [ -x "$BIN" ] && "$BIN" --check >/dev/null 2>&1; }
-
-screen_ok() {
-  local out
-  out=$("$BIN" --probe-screen 2>/dev/null || true)
-  [ "$out" = "screen=ok" ]
-}
 
 chatgpt_running() { pgrep -x ChatGPT >/dev/null 2>&1; }
 
@@ -137,7 +129,6 @@ permission_help() {
   say "$(t 'Permission needed: Accessibility.' '缺少权限：辅助功能。')"
   say "$(t 'Grant it to the terminal app you run codex-retry from:' '请给运行 codex-retry 的终端 App 授权：')"
   say "  System Settings › Privacy & Security › Accessibility (Device Control and Data Access)"
-  say "$(t 'Also grant Screen Recording so the retry button can be located.' '还需要「屏幕录制」，用于定位「重试」按钮。')"
   say "$(t 'Opening System Settings…' '正在打开系统设置…')"
   open_privacy_pane
 }
@@ -158,10 +149,6 @@ start_daemon() {
   if ! chatgpt_running; then
     say "$(t 'note: ChatGPT is not running yet; the daemon will wait for it.' '提示：ChatGPT 目前没在运行，daemon 会自动等它。')"
   fi
-  if ! screen_ok; then
-    say "$(t 'warning: Screen Recording is missing; retry buttons cannot be located.' '警告：缺少「屏幕录制」权限，无法定位「重试」按钮。')"
-    open_privacy_pane
-  fi
   nohup "$BIN" --idle="$IDLE" --cooldown="$COOLDOWN" --interval="$INTERVAL" \
     --sweep-idle="$SWEEP_IDLE" --sweep-every="$SWEEP_EVERY" \
     --sweep-cooldown="$SWEEP_COOLDOWN" --sweep-recent-min="$SWEEP_RECENT_MIN" \
@@ -174,7 +161,7 @@ start_daemon() {
     return 1
   fi
   say "$(t "✅ auto-retry started (pid $pid)" "✅ 自动重试已开启（pid ${pid}）")"
-  say "$(t '   Retry buttons are clicked automatically; run the same command again to stop.' '   出现「重试」按钮会自动点；再运行一次本命令即可关闭。')"
+  say "$(t '   Retry buttons are pressed automatically; run the same command again to stop.' '   出现「重试」按钮会自动重试；再运行一次本命令即可关闭。')"
   say "$(t "   log: $LOG" "   日志：${LOG}")"
 }
 
@@ -196,72 +183,41 @@ stop_daemon() {
 }
 
 status_report() {
-  local pids
+  local pids ok=0
   pids=$(daemon_pids | tr '\n' ' ')
   if [ -n "${pids// /}" ]; then
-    say "$(t "status: running (pid ${pids% })" "状态：运行中（pid ${pids% }）")"
+    say "$(t "daemon: running (pid ${pids% })" "daemon：运行中（pid ${pids% }）")"
   else
-    say "$(t 'status: stopped' '状态：未运行')"
+    say "$(t 'daemon: stopped' 'daemon：未运行')"
   fi
-  if permission_ok; then
-    say "$(t 'accessibility: granted' '权限（辅助功能）：已授权')"
-  else
-    say "$(t 'accessibility: missing' '权限（辅助功能）：缺失')"
-  fi
-  if screen_ok; then
-    say "$(t 'screen recording: ok' '权限（屏幕录制）：正常')"
-  else
-    say "$(t 'screen recording: missing or no ChatGPT window' '权限（屏幕录制）：缺失或没有 ChatGPT 窗口')"
-  fi
-  if chatgpt_running; then
-    say "$(t 'ChatGPT: running' 'ChatGPT：运行中')"
-  else
-    say "$(t 'ChatGPT: not running' 'ChatGPT：未运行')"
-  fi
-  if [ -f "$LOG" ]; then
-    local clicks
-    clicks=$(grep -c '] click' "$LOG" 2>/dev/null || true)
-    say "$(t "clicks so far: ${clicks:-0}" "累计自动点击：${clicks:-0} 次")"
-    say "$(t 'recent log:' '最近日志：')"
-    tail -3 "$LOG" | sed 's/^/    /'
-    say "$(t "full log: $LOG" "完整日志：${LOG}")"
-  else
-    say "$(t "log: $LOG (empty)" "日志：${LOG}（暂无）")"
-  fi
-}
-
-doctor() {
-  say "$(t '— codex-retry self-check —' '— codex-retry 自检 —')"
-  if [ -x "$BIN" ]; then
-    say "$(t "binary: $BIN ✓" "程序：${BIN} ✓")"
-  else
-    say "$(t "binary: missing ✗" "程序：缺失 ✗")"
+  if [ ! -x "$BIN" ]; then
+    say "$(t "binary: missing $BIN ✗ (reinstall)" "程序：缺失 ${BIN} ✗（请重新安装）")"; ok=1
   fi
   if permission_ok; then
     say "$(t 'accessibility: granted ✓' '权限（辅助功能）：已授权 ✓')"
   else
-    say "$(t 'accessibility: missing ✗' '权限（辅助功能）：缺失 ✗')"
+    say "$(t 'accessibility: missing ✗ (grant it to this terminal app)' '权限（辅助功能）：缺失 ✗（请给当前终端授权）')"; ok=1
   fi
   if chatgpt_running; then
     say "$(t 'ChatGPT: running ✓' 'ChatGPT：运行中 ✓')"
-    local wins
-    wins=$(osascript -e 'tell application "System Events" to tell process "ChatGPT" to count windows' 2>/dev/null || true)
-    [ -n "$wins" ] && say "$(t "ChatGPT windows: $wins" "ChatGPT 窗口数：${wins}")"
   else
-    say "$(t 'ChatGPT: not running ✗' 'ChatGPT：未运行 ✗')"
+    say "$(t 'ChatGPT: not running' 'ChatGPT：未运行')"
   fi
-  if screen_ok; then
-    say "$(t 'screen recording: ok ✓' '权限（屏幕录制）：正常 ✓')"
-  else
-    say "$(t 'screen recording: missing ✗ (grant it to the terminal)' '权限（屏幕录制）：缺失 ✗（请给终端授权）')"
-  fi
-  local dps
-  dps=$(daemon_pids | tr '\n' ' ')
-  say "$(t "daemon: ${dps:-stopped}" "daemon：${dps:-未运行}")"
   if [ -f "$LOG" ]; then
-    say "$(t 'recent log:' '日志尾部：')"
+    local retries
+    retries=$(grep -c '] retry (' "$LOG" 2>/dev/null || true)
+    say "$(t "retries so far: ${retries:-0}" "累计自动重试：${retries:-0} 次")"
+    say "$(t "recent log ($LOG):" "最近日志（${LOG}）：")"
     tail -5 "$LOG" | sed 's/^/    /'
   fi
+  return $ok
+}
+
+uninstall() {
+  stop_daemon >/dev/null
+  rm -f "$HOME/.local/bin/codex-retry"
+  rm -rf "$BASE" "$STATE"
+  say "$(t 'codex-retry uninstalled. You can remove the terminal from the Accessibility list in System Settings.' '已卸载 codex-retry。可在系统设置的「辅助功能」列表中移除终端授权（如不再需要）。')"
 }
 
 toggle_daemon() {
@@ -277,7 +233,7 @@ case "$cmd" in
   ""|toggle) toggle_daemon ;;
   start|on) start_daemon ;;
   stop|off) stop_daemon ;;
-  status|st) status_report ;;
+  status|st|doctor|check) status_report ;;
   log|logs)
     [ -f "$LOG" ] || die "$(t "no log yet: $LOG" "暂无日志：${LOG}")"
     tail -f "$LOG"
@@ -285,7 +241,7 @@ case "$cmd" in
   sweep) "$BIN" --sweep-once --log="$LOG" ;;
   threads) "$BIN" --list-threads ;;
   restart) stop_daemon; sleep 0.3; start_daemon ;;
-  doctor|check) doctor ;;
+  uninstall) uninstall ;;
   version|--version|-v) "$BIN" --version ;;
   help|-h|--help|usage) usage ;;
   *)

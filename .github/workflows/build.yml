@@ -14,4 +14,4 @@ jobs:
       - name: Syntax-check the CLI
         run: bash -n bin/codex-retry
       - name: Syntax-check install scripts
-        run: bash -n install.sh && bash -n uninstall.sh
+        run: bash -n install.sh

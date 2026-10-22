@@ -61,7 +61,15 @@ So writing/retrying from outside the UI is not possible without closing the app,
 
 - Bundle id: `com.openai.codex`; window owner name is `ChatGPT`.
 - The Retry button is an `AXButton` whose AXTitle is the localized label (`重试` for zh, `Retry` for en, …).
-  It exposes only `AXShowMenu` / `AXScrollToVisible` actions (no `AXPress`), so a coordinate click is required.
+  It exposes only `AXShowMenu` / `AXScrollToVisible` actions (no `AXPress`), but it is focusable: setting
+  `AXFocused` on it and posting Return to the app pid presses it while the app stays in the background.
+  Verified 2026-10-22 on four separate presses (two windows, one of them not the app's main window, plus two
+  hidden sessions); each produced a `capacity_retry_manual` turn in the rollout, with the frontmost app and
+  the mouse position unchanged. The AX frame centre matched the earlier OCR point within 1–2 px.
+- While the app is in the background, the app-level `AXFocusedUIElement` is `nil`; the button's own `AXFocused`
+  attribute is reliable (it turns false when the composer takes focus and true again after refocusing).
+- Background mouse events (`CGEvent.postToPid`, also with window-number fields 91/92) and Space do not press it.
+- `codex://threads/<id>` activates the app even when opened through `NSWorkspace` with `activates = false`.
 - When the transcript has many failed attempts, the Retry button can be below the fold;
   `AXScrollToVisible` scrolls it into view.
 - macOS truncates long window titles with a middle ellipsis, which is why thread↔window matching compares a

@@ -3,18 +3,20 @@ import ApplicationServices
 import AppKit
 import CoreGraphics
 import IOKit
-import Vision
 import Darwin
 
 // ChatGPT capacity-error auto-retry daemon.
-// Detection: window screenshot + Vision OCR for "重试"/"Retry"/"Try again" (only visible buttons count).
-// Action: raise the window, click the button with a synthetic HID event, then restore the previous app.
-// Safety: while the user is actively using the Mac (< idleThreshold), only the focused ChatGPT window is clicked,
-//         so focus is never stolen from another app.
+// Detection: the Retry button in the app's Accessibility tree (no screenshots, no OCR).
+// Action: focus the button through Accessibility and send Return to the app process, which works while the
+//         app stays in the background. If that fails and the user is idle, fall back to a real mouse click.
+// Safety: Return is only sent after the button reports keyboard focus, so it can never submit a draft; while
+//         the user is working in ChatGPT nothing is touched until they have been idle for a while.
 
+let version = "1.1.0"
+let codexBundleID = "com.openai.codex"
 var args = Array(CommandLine.arguments.dropFirst())
 if args.contains("--version") {
-    print("codex-retry 1.0.0")
+    print("codex-retry \(version)")
     exit(0)
 }
 if args.contains("--check") {
@@ -22,7 +24,6 @@ if args.contains("--check") {
     print(trusted ? "permission=ok" : "permission=missing")
     exit(trusted ? 0 : 3)
 }
-if args.contains("--once") { } // no-op clarity: single cycle mode parsed below
 func flag(_ n: String) -> Bool { args.contains(n) }
 func opt(_ n: String, _ def: String) -> String {
     if let a = args.first(where: { $0.hasPrefix("--\(n)=") }) { return String(a.split(separator: "=", maxSplits: 1).last!) }
@@ -40,26 +41,7 @@ let sweepEvery = Double(opt("sweep-every", "60")) ?? 60
 let sweepCooldown = Double(opt("sweep-cooldown", "120")) ?? 120
 let sweepRecentMin = Double(opt("sweep-recent-min", "120")) ?? 120
 let sweepOnce = flag("--sweep-once")
-
-// OCR languages: honour --languages=..., otherwise use the system language plus English.
-func preferredOCRLanguages() -> [String] {
-    if let a = args.first(where: { $0.hasPrefix("--languages=") }) {
-        let list = a.split(separator: "=", maxSplits: 1).last.map(String.init) ?? ""
-        let parsed = list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        if !parsed.isEmpty { return parsed }
-    }
-    var langs: [String] = []
-    if let pref = Locale.preferredLanguages.first, !pref.isEmpty {
-        let parts = pref.split(separator: "-")
-        if parts.count >= 2 { langs.append("\(parts[0])-\(parts[1])") } else { langs.append(pref) }
-    }
-    if !langs.contains("en-US") { langs.append("en-US") }
-    return Array(Set(langs))
-}
-let ocrLanguages = preferredOCRLanguages()
 let logPath = opt("log", "/tmp/codex-retry.log")
-let tmpDir = "/tmp/chatgpt_retry_daemon"
-try? FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
 
 let df = DateFormatter(); df.dateFormat = "HH:mm:ss"
 func log(_ s: String) {
@@ -73,7 +55,7 @@ func log(_ s: String) {
 }
 
 // ---------- user-activity tracking ----------
-// HIDIdleTime is reset by our own synthetic mouse events, so infer user idleness from it plus our own post times.
+// HIDIdleTime is reset by our own synthetic mouse events (fallback clicks), so infer user idleness from it plus our own post times.
 var lastSyntheticAt = Date(timeIntervalSinceNow: -3600)
 var lastUserEventAt = Date(timeIntervalSinceNow: -30)
 var activityInitialized = false
@@ -96,121 +78,42 @@ func updateUserActivity() {
 }
 func userIdleSeconds() -> Double { max(0, Date().timeIntervalSince(lastUserEventAt)) }
 
-// ---------- windows ----------
-struct CgWindow { let id: Int; let pid: pid_t; let title: String; let x: Double; let y: Double; let w: Double; let h: Double }
-func chatgptWindows() -> [CgWindow] {
-    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
-    var out: [CgWindow] = []
-    for w in list {
-        guard (w[kCGWindowOwnerName as String] as? String) == "ChatGPT",
-              (w[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
-        let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
-        let ww = (b["Width"] as? NSNumber)?.doubleValue ?? 0
-        let hh = (b["Height"] as? NSNumber)?.doubleValue ?? 0
-        if ww < 200 || hh < 200 { continue }
-        out.append(CgWindow(id: w[kCGWindowNumber as String] as? Int ?? 0,
-                            pid: w[kCGWindowOwnerPID as String] as? pid_t ?? 0,
-                            title: w[kCGWindowName as String] as? String ?? "",
-                            x: (b["X"] as? NSNumber)?.doubleValue ?? 0,
-                            y: (b["Y"] as? NSNumber)?.doubleValue ?? 0, w: ww, h: hh))
-    }
-    return out
-}
-func chatgptApp() -> NSRunningApplication? {
-    NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == "com.openai.codex" }
-}
 
-// ---------- AX raise ----------
+// ---------- Accessibility ----------
 func axAttr(_ el: AXUIElement, _ n: String) -> AnyObject? { var v: AnyObject?; return AXUIElementCopyAttributeValue(el, n as CFString, &v) == .success ? v : nil }
 func axStr(_ el: AXUIElement, _ n: String) -> String? { axAttr(el, n) as? String }
+func axBool(_ el: AXUIElement, _ n: String) -> Bool { axAttr(el, n) as? Bool ?? false }
 func axKids(_ el: AXUIElement) -> [AXUIElement] { (axAttr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? [] }
-func axPoint(_ el: AXUIElement) -> CGPoint? { guard let v = axAttr(el, kAXPositionAttribute) else { return nil }; var p = CGPoint.zero; AXValueGetValue(v as! AXValue, .cgPoint, &p); return p }
-func axSize(_ el: AXUIElement) -> CGSize? { guard let v = axAttr(el, kAXSizeAttribute) else { return nil }; var s = CGSize.zero; AXValueGetValue(v as! AXValue, .cgSize, &s); return s }
-func axWindows(_ app: AXUIElement) -> [AXUIElement] { (axAttr(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] }
-func focusedWindow(_ app: AXUIElement) -> AXUIElement? { guard let v = axAttr(app, kAXFocusedWindowAttribute) else { return nil }; return (v as! AXUIElement) }
-func sameWindow(_ a: AXUIElement, _ b: AXUIElement) -> Bool { CFEqual(a, b) }
+func axSet(_ el: AXUIElement, _ n: String, _ v: CFTypeRef) { AXUIElementSetAttributeValue(el, n as CFString, v) }
+func axFrame(_ el: AXUIElement) -> CGRect? {
+    guard let pv = axAttr(el, kAXPositionAttribute), let sv = axAttr(el, kAXSizeAttribute) else { return nil }
+    var p = CGPoint.zero, s = CGSize.zero
+    AXValueGetValue(pv as! AXValue, .cgPoint, &p); AXValueGetValue(sv as! AXValue, .cgSize, &s)
+    return CGRect(origin: p, size: s)
+}
+func focusedWindow(_ app: AXUIElement) -> AXUIElement? { axAttr(app, kAXFocusedWindowAttribute).map { $0 as! AXUIElement } }
 
-func raise(matching cg: CgWindow) -> Bool {
-    guard let app = chatgptApp() else { return false }
-    let axApp = AXUIElementCreateApplication(app.processIdentifier)
-    for w in axWindows(axApp) {
-        guard let title = axStr(w, kAXTitleAttribute), let p = axPoint(w), let s = axSize(w) else { continue }
-        if abs(p.x - cg.x) < 2.5 && abs(p.y - cg.y) < 2.5 && abs(s.width - cg.w) < 2.5 && abs(s.height - cg.h) < 2.5 {
-            _ = AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(w, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            _ = title
-            return true
-        }
-    }
-    // fall back: match by title prefix + same size
-    for w in axWindows(axApp) {
-        guard let title = axStr(w, kAXTitleAttribute), let s = axSize(w), let p = axPoint(w) else { continue }
-        if abs(s.width - cg.w) < 2.5 && abs(s.height - cg.h) < 2.5 && (title == cg.title || cg.title.hasPrefix(String(title.prefix(20)))) && abs(p.y - cg.y) < 2.5 {
-            _ = AXUIElementPerformAction(w, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(w, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            return true
-        }
-    }
-    return false
+struct Win { let el: AXUIElement; let title: String }
+func chatgptApp() -> NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == codexBundleID }
 }
-func axWindowFor(_ cg: CgWindow) -> AXUIElement? {
-    guard let app = chatgptApp() else { return nil }
-    let axApp = AXUIElementCreateApplication(app.processIdentifier)
-    for w in axWindows(axApp) {
-        guard let p = axPoint(w), let s = axSize(w) else { continue }
-        if abs(p.x - cg.x) < 2.5 && abs(p.y - cg.y) < 2.5 && abs(s.width - cg.w) < 2.5 && abs(s.height - cg.h) < 2.5 { return w }
+var axEnabledFor: pid_t = 0
+func chatgptAX(_ app: NSRunningApplication) -> AXUIElement {
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    if axEnabledFor != app.processIdentifier {
+        // Chromium-based apps build their full AX tree only once an assistive client asks for it.
+        axSet(ax, "AXManualAccessibility", kCFBooleanTrue)
+        axEnabledFor = app.processIdentifier
     }
-    return nil
+    return ax
 }
-func findRetryButton(_ el: AXUIElement, _ depth: Int = 0) -> AXUIElement? {
-    guard depth < 60 else { return nil }
-    if axStr(el, kAXRoleAttribute) == kAXButtonRole as String {
-        let t = "\(axStr(el, kAXTitleAttribute) ?? "") \(axStr(el, kAXDescriptionAttribute) ?? "")"
-        if t.contains("重试") || t.lowercased().contains("retry") { return el }
+func appWindows(_ app: AXUIElement) -> [Win] {
+    ((axAttr(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).compactMap { w in
+        guard axStr(w, kAXRoleAttribute) == kAXWindowRole as String else { return nil }
+        return Win(el: w, title: axStr(w, kAXTitleAttribute) ?? "")
     }
-    for c in axKids(el) { if let r = findRetryButton(c, depth + 1) { return r } }
-    return nil
-}
-func revealRetryButton(_ cg: CgWindow) -> Bool {
-    guard let w = axWindowFor(cg), let b = findRetryButton(w) else { return false }
-    _ = AXUIElementPerformAction(b, "AXScrollToVisible" as CFString)
-    usleep(350_000)
-    return true
 }
 
-func activate(_ app: NSRunningApplication) {
-    DispatchQueue.main.async { app.activate(options: []) }
-    RunLoop.current.run(until: Date().addingTimeInterval(0.28))
-}
-func clickAt(_ p: CGPoint) {
-    lastSyntheticAt = Date()
-    let src = CGEventSource(stateID: .hidSystemState)
-    CGWarpMouseCursorPosition(p)
-    usleep(70_000)
-    CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
-    usleep(50_000)
-    CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
-    usleep(50_000)
-}
-
-// ---------- OCR detection ----------
-var captureWarningLogged = false
-func capture(_ winID: Int, _ path: String) -> Bool {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    p.arguments = ["-l", String(winID), "-o", "-x", path]
-    do { try p.run(); p.waitUntilExit() } catch { return false }
-    if p.terminationStatus != 0 {
-        if !captureWarningLogged {
-            captureWarningLogged = true
-            log("screencapture failed — grant Screen Recording permission to the terminal app running codex-retry")
-        }
-        return false
-    }
-    return true
-}
 // Localized labels of the retry button in the ChatGPT/Codex desktop UI.
 let retryKeywords = [
     "重试", "重試", "retry", "try again",
@@ -220,96 +123,111 @@ let retryKeywords = [
     "tentar novamente", "повторить", "opnieuw proberen",
     "spróbuj ponownie", "yeniden dene", "tekrar dene",
 ]
+// A button label is short: accept the keyword plus at most a couple of extra characters.
 func isRetryLabel(_ s: String) -> Bool {
     let t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if t.isEmpty { return false }
-    for k in retryKeywords where t.contains(k) { return true }
+    return retryKeywords.contains { t.contains($0) && t.count <= $0.count + 2 }
+}
+func findAll(_ el: AXUIElement, role: String, depth: Int = 0, _ match: (AXUIElement) -> Bool = { _ in true }) -> [AXUIElement] {
+    guard depth < 60 else { return [] }
+    var out: [AXUIElement] = []
+    if axStr(el, kAXRoleAttribute) == role && match(el) { out.append(el) }
+    for c in axKids(el) { out += findAll(c, role: role, depth: depth + 1, match) }
+    return out
+}
+// The newest error, and so the live Retry button, is the bottom-most one.
+func retryButton(in w: AXUIElement) -> AXUIElement? {
+    findAll(w, role: kAXButtonRole as String) {
+        isRetryLabel(axStr($0, kAXTitleAttribute) ?? "") || isRetryLabel(axStr($0, kAXDescriptionAttribute) ?? "")
+    }.max { (axFrame($0)?.minY ?? 0) < (axFrame($1)?.minY ?? 0) }
+}
+func waitUntilGone(_ w: AXUIElement) -> Bool {
+    for _ in 0..<10 {
+        usleep(150_000)
+        if retryButton(in: w) == nil { return true }
+    }
     return false
 }
-func ocrRetryPoints(imagePath: String, win: CgWindow) -> [CGPoint] {
-    guard let img = NSImage(contentsOfFile: imagePath), let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return [] }
-    let pxW = Double(cg.width), pxH = Double(cg.height)
-    guard pxW > 0, pxH > 0 else { return [] }
-    let req = VNRecognizeTextRequest()
-    req.recognitionLevel = .accurate
-    req.usesLanguageCorrection = false
-    req.recognitionLanguages = ocrLanguages
-    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
-    guard (try? handler.perform([req])) != nil else { return [] }
-    var pts: [CGPoint] = []
-    for obs in (req.results ?? []) {
-        guard let top = obs.topCandidates(1).first, isRetryLabel(top.string) else { continue }
-        let box = obs.boundingBox
-        let cx = (box.origin.x + box.size.width / 2) * pxW * (win.w / pxW)
-        let cy = (1.0 - box.origin.y - box.size.height / 2) * pxH * (win.h / pxH)
-        pts.append(CGPoint(x: win.x + cx, y: win.y + cy))
+
+// ---------- pressing ----------
+// Background press: make the window the app's main window, give the button keyboard focus, and post Return
+// to the app process. The app is not activated and the mouse is not moved.
+func pressInBackground(_ b: AXUIElement, _ w: Win, _ app: NSRunningApplication, _ axApp: AXUIElement) -> Bool {
+    let prevMain = focusedWindow(axApp)
+    let composer = findAll(w.el, role: kAXTextAreaRole as String).first
+    let composerFocused = composer.map { axBool($0, kAXFocusedAttribute) } ?? false
+    defer {
+        if composerFocused, let c = composer { axSet(c, kAXFocusedAttribute, kCFBooleanTrue) }
+        if let p = prevMain, !CFEqual(p, w.el) { axSet(p, kAXMainAttribute, kCFBooleanTrue) }
     }
-    return pts
+    axSet(w.el, kAXMainAttribute, kCFBooleanTrue)
+    axSet(b, kAXFocusedAttribute, kCFBooleanTrue)
+    usleep(150_000)
+    // Return goes to whatever holds keyboard focus; never send it unless that is the button.
+    guard axBool(b, kAXFocusedAttribute) else { log("  focus did not land on the button"); return false }
+    let src = CGEventSource(stateID: .hidSystemState)
+    for down in [true, false] {
+        CGEvent(keyboardEventSource: src, virtualKey: 36, keyDown: down)?.postToPid(app.processIdentifier)
+        usleep(40_000)
+    }
+    return waitUntilGone(w.el)
+}
+
+func activate(_ app: NSRunningApplication) {
+    DispatchQueue.main.async { app.activate(options: []) }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.28))
+}
+// Fallback: bring the window forward and click the button's centre, then give focus back.
+func clickButton(_ b: AXUIElement, _ w: Win, _ app: NSRunningApplication, _ axApp: AXUIElement, front: NSRunningApplication?) -> Bool {
+    _ = AXUIElementPerformAction(b, "AXScrollToVisible" as CFString)
+    usleep(300_000)
+    activate(app)
+    _ = AXUIElementPerformAction(w.el, kAXRaiseAction as CFString)
+    axSet(w.el, kAXMainAttribute, kCFBooleanTrue)
+    usleep(250_000)
+    defer { if let front, front.bundleIdentifier != codexBundleID { activate(front) } }
+    guard let fw = focusedWindow(axApp), CFEqual(fw, w.el) else { log("  skip: could not focus the window"); return false }
+    guard let f = axFrame(b), let wf = axFrame(w.el), wf.contains(CGPoint(x: f.midX, y: f.midY)) else {
+        log("  skip: button is outside the window"); return false
+    }
+    let p = CGPoint(x: f.midX, y: f.midY)
+    lastSyntheticAt = Date()
+    let src = CGEventSource(stateID: .hidSystemState)
+    CGWarpMouseCursorPosition(p)
+    usleep(70_000)
+    CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(50_000)
+    CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+    return waitUntilGone(w.el)
 }
 
 // ---------- main loop ----------
 var lastClickAt: [String: Date] = [:]
 
-func performClick(_ win: CgWindow, aggressive: Bool, front: NSRunningApplication?) -> Bool {
-    guard let app = chatgptApp() else { return false }
-    let axApp = AXUIElementCreateApplication(app.processIdentifier)
-    let key = win.title
-    if let last = lastClickAt[key], Date().timeIntervalSince(last) < clickCooldown { return false }
-    if aggressive { _ = revealRetryButton(win) }
-    let path = "\(tmpDir)/win_\(win.id).png"
-    guard capture(win.id, path) else { return false }
-    let pts = ocrRetryPoints(imagePath: path, win: win)
-    guard let p = pts.first else { return false }
-    log("click \(aggressive ? "(user idle \(Int(userIdleSeconds()))s)" : "(front)") title=\(win.title.prefix(20)) at (\(Int(p.x)),\(Int(p.y)))")
-    if dryRun { lastClickAt[key] = Date(); return true }
-    let restore = (front != nil && front!.bundleIdentifier != "com.openai.codex") ? front : nil
-    activate(app)
-    if !raise(matching: win) { log("  skip: could not raise target window"); return false }
-    usleep(250_000)
-    let fw = focusedWindow(axApp)
-    let focusedOK = fw.map { fwEl -> Bool in
-        guard let fp = axPoint(fwEl), let fs = axSize(fwEl) else { return false }
-        return abs(fp.x - win.x) <= 2 && abs(fp.y - win.y) <= 2 && abs(fs.width - win.w) <= 2.5 && abs(fs.height - win.h) <= 2.5
-    } ?? false
-    if !focusedOK { log("  skip: focus check failed"); return false }
-    let path2 = "\(tmpDir)/win_\(win.id)_after.png"
-    var livePoint: CGPoint? = nil
-    if capture(win.id, path2) {
-        let pts2 = ocrRetryPoints(imagePath: path2, win: win)
-        livePoint = pts2.min { abs($0.y - p.y) < abs($1.y - p.y) } ?? pts2.first
-    }
-    guard let lp = livePoint else { log("  skip: button no longer visible after activation"); return false }
-    clickAt(lp)
-    usleep(500_000)
-    lastClickAt[key] = Date()
-    if let restore { activate(restore) }
-    return true
+func retry(_ b: AXUIElement, _ w: Win, _ app: NSRunningApplication, _ axApp: AXUIElement,
+           allowClick: Bool, front: NSRunningApplication?) -> Bool {
+    let name = w.title.prefix(24)
+    lastClickAt[w.title] = Date()
+    if dryRun { log("retry (dry-run) title=\(name)"); return true }
+    if pressInBackground(b, w, app, axApp) { log("retry (background) title=\(name)"); return true }
+    guard allowClick else { log("skip title=\(name): background press failed; will click once the user is idle"); return false }
+    if clickButton(b, w, app, axApp, front: front) { log("retry (click) title=\(name)"); return true }
+    return false
 }
 
 func oneCycle() -> Int {
     updateUserActivity()
-    let wins = chatgptWindows()
-    if wins.isEmpty { return 0 }
     guard let app = chatgptApp() else { return 0 }
-    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    let axApp = chatgptAX(app)
     let front = NSWorkspace.shared.frontmostApplication
-    let chatgptFront = front?.bundleIdentifier == "com.openai.codex"
-    let idle = userIdleSeconds()
-    let aggressive = aggressiveAlways || idle >= idleThreshold
-    let focused = focusedWindow(axApp)
+    let idle = aggressiveAlways || userIdleSeconds() >= idleThreshold
+    // Moving keyboard focus would disturb someone typing in ChatGPT, so wait until they pause.
+    if front?.bundleIdentifier == codexBundleID && !idle { return 0 }
     var clicks = 0
-    for win in wins {
-        let key = win.title
-        if let last = lastClickAt[key], Date().timeIntervalSince(last) < clickCooldown { continue }
-        let isFocused: Bool = {
-            guard let fw = focused else { return false }
-            guard let p = axPoint(fw), let s = axSize(fw) else { return false }
-            return abs(p.x - win.x) < 2.5 && abs(p.y - win.y) < 2.5 && abs(s.width - win.w) < 2.5 && abs(s.height - win.h) < 2.5
-        }()
-        if !aggressive {
-            guard chatgptFront && isFocused else { continue }
-        }
-        if performClick(win, aggressive: aggressive, front: front) { clicks += 1 }
+    for w in appWindows(axApp) {
+        if let last = lastClickAt[w.title], Date().timeIntervalSince(last) < clickCooldown { continue }
+        guard let b = retryButton(in: w.el) else { continue }
+        if retry(b, w, app, axApp, allowClick: idle, front: front) { clicks += 1 }
     }
     return clicks
 }
@@ -455,7 +373,7 @@ final class AppServerClient {
             guard let head = readExact(2) else { return nil }
             let fin = (head[0] & 0x80) != 0
             let opcode = head[0] & 0x0F
-            guard let maskedBit = Optional(head[1] & 0x80) else { return nil }
+            let maskedBit = head[1] & 0x80
             var length = Int(head[1] & 0x7F)
             if length == 126 {
                 guard let ext = readExact(2) else { return nil }
@@ -499,10 +417,7 @@ final class AppServerClient {
             guard let frame = readMessage(),
                   let obj = try? JSONSerialization.jsonObject(with: frame) as? [String: Any] else { return nil }
             if let rid = obj["id"] as? Int, rid == id {
-                if let err = obj["error"] as? [String: Any] {
-                    _ = err
-                    return nil
-                }
+                if obj["error"] != nil { return nil }
                 return obj["result"] as? [String: Any] ?? [:]
             }
             // otherwise a notification; keep reading
@@ -510,7 +425,7 @@ final class AppServerClient {
     }
 
     func threads(limit: Int = 100) -> [ThreadInfo]? {
-        _ = rpc("initialize", ["clientInfo": ["name": "codex-retry", "version": "1.0"], "capabilities": [:]])
+        _ = rpc("initialize", ["clientInfo": ["name": "codex-retry", "version": version], "capabilities": [:]])
         guard let result = rpc("thread/list", ["limit": limit]),
               let data = result["data"] as? [[String: Any]] else { return nil }
         return data.compactMap { t in
@@ -541,15 +456,14 @@ func titlesMatch(_ a: String, _ b: String) -> Bool {
     return !ka.isEmpty && ka == kb
 }
 
+// Rollouts can grow to tens of MB, so only the tail is read.
 func lastTurnFailedCapacity(_ path: String) -> Bool {
-    guard !path.isEmpty,
-          let data = FileManager.default.contents(atPath: path),
-          !data.isEmpty else { return false }
-    let lines = data.split(separator: 0x0A)
-    var seen = 0
-    for line in lines.reversed() {
-        seen += 1
-        if seen > 400 { break }
+    guard !path.isEmpty, let fh = FileHandle(forReadingAtPath: path) else { return false }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    try? fh.seek(toOffset: size > 512_000 ? size - 512_000 : 0)
+    guard let data = try? fh.readToEnd(), !data.isEmpty else { return false }
+    for line in data.split(separator: 0x0A).reversed().prefix(400) {
         guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
               let payload = obj["payload"] as? [String: Any],
               let t = payload["type"] as? String else { continue }
@@ -558,7 +472,7 @@ func lastTurnFailedCapacity(_ path: String) -> Bool {
             guard let err = payload["error"] as? [String: Any] else { return false }
             let info = ((err["codex_error_info"] as? String) ?? "").lowercased()
             let msg = ((err["message"] as? String) ?? "").lowercased()
-            return info.contains("overload") || msg.contains("at capacity") || msg.contains("capacity")
+            return info.contains("overload") || msg.contains("capacity")
         }
     }
     return false
@@ -570,6 +484,7 @@ func openThread(_ id: String) {
     p.arguments = ["codex://threads/\(id)"]
     do { try p.run(); p.waitUntilExit() } catch { }
 }
+
 
 var lastSweepAt = Date(timeIntervalSinceNow: -3600)
 var lastSweepClick: [String: Date] = [:]
@@ -584,66 +499,53 @@ func sweep(force: Bool = false) -> Int {
     }
     guard let threads = fetchThreads(), !threads.isEmpty else { return 0 }
     lastSweepAt = now
-    let wins = chatgptWindows()
-    guard !wins.isEmpty, let app = chatgptApp() else { return 0 }
-    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    guard let app = chatgptApp() else { return 0 }
+    let axApp = chatgptAX(app)
+    let wins = appWindows(axApp)
+    guard !wins.isEmpty else { return 0 }
     var hidden: [ThreadInfo] = []
     let nowTs = Date().timeIntervalSince1970
     for t in threads {
-        guard lastTurnFailedCapacity(t.path) else { continue }
         if let u = t.updatedAt, sweepRecentMin > 0, nowTs - u > sweepRecentMin * 60 { continue }
         if !force, let cd = lastSweepClick[t.id], now.timeIntervalSince(cd) < sweepCooldown { continue }
         if wins.contains(where: { titlesMatch($0.title, t.name) }) { continue }
+        guard lastTurnFailedCapacity(t.path) else { continue }
         hidden.append(t)
     }
     guard !hidden.isEmpty else { return 0 }
-    var target = wins[0]
-    if let fw = focusedWindow(axApp), let fp = axPoint(fw), let fs = axSize(fw) {
-        target = wins.first { w in
-            abs(w.x - fp.x) < 2.5 && abs(w.y - fp.y) < 2.5 && abs(w.w - fs.width) < 2.5 && abs(w.h - fs.height) < 2.5
-        } ?? target
-    }
+    let target = focusedWindow(axApp).flatMap { fw in wins.first { CFEqual($0.el, fw) } } ?? wins[0]
     let restore = threads.first { titlesMatch(target.title, $0.name) }
+    let front = NSWorkspace.shared.frontmostApplication
     log("sweep: \(hidden.count) hidden failed session(s); using window \(target.title.prefix(24))")
     var clicked = 0
     for t in hidden.prefix(3) {
         log("sweep: open \(t.name.prefix(28))")
         if dryRun { clicked += 1; continue }
-        activate(app)
-        _ = raise(matching: target)
-        usleep(300_000)
+        // the deep link navigates the app's main window (and activates the app)
+        axSet(target.el, kAXMainAttribute, kCFBooleanTrue)
         openThread(t.id)
-        var shown: CgWindow? = nil
-        for _ in 0..<12 {
+        var button: AXUIElement? = nil
+        var shown: Win? = nil
+        for _ in 0..<15 {
             usleep(300_000)
-            if let w = chatgptWindows().first(where: { titlesMatch($0.title, t.name) }) { shown = w; break }
+            shown = appWindows(axApp).first { titlesMatch($0.title, t.name) }
+            if let w = shown, let b = retryButton(in: w.el) { button = b; break }
         }
-        guard let win = shown else { log("sweep: window did not navigate in time"); continue }
-        usleep(400_000)
-        lastClickAt[win.title] = nil
-        if performClick(win, aggressive: true, front: nil) {
+        guard let w = shown, let b = button else { log("sweep: no retry button after opening (will retry next sweep)"); continue }
+        lastClickAt[w.title] = nil
+        if retry(b, w, app, axApp, allowClick: true, front: nil) {
             clicked += 1
             lastSweepClick[t.id] = Date()
-            log("sweep: retried \(t.name.prefix(28))")
-        } else {
-            log("sweep: no retry button after opening (will retry next sweep)")
         }
-        usleep(400_000)
     }
     if let r = restore, !dryRun {
         log("sweep: restore \(r.name.prefix(28))")
+        axSet(target.el, kAXMainAttribute, kCFBooleanTrue)
         openThread(r.id)
         usleep(600_000)
     }
+    if let front, front.bundleIdentifier != codexBundleID, !dryRun { activate(front) }
     return clicked
-}
-
-if flag("--probe-screen") {
-    guard let win = chatgptWindows().first else { print("no-window"); exit(6) }
-    let path = "\(tmpDir)/probe.png"
-    let ok = capture(win.id, path)
-    print(ok ? "screen=ok" : "screen=missing")
-    exit(ok ? 0 : 4)
 }
 
 if flag("--list-threads") {
@@ -652,7 +554,7 @@ if flag("--list-threads") {
     exit(0)
 }
 
-log("retry_daemon start idle=\(Int(idleThreshold))s cooldown=\(Int(clickCooldown))s sweep=\(sweepEnabled) sweepIdle=\(Int(sweepIdle))s dryRun=\(dryRun) aggressiveAlways=\(aggressiveAlways)")
+log("retry_daemon \(version) start idle=\(Int(idleThreshold))s cooldown=\(Int(clickCooldown))s sweep=\(sweepEnabled) sweepIdle=\(Int(sweepIdle))s dryRun=\(dryRun) aggressiveAlways=\(aggressiveAlways)")
 if sweepOnce {
     activityInitialized = true
     lastUserEventAt = Date(timeIntervalSinceNow: -3600)

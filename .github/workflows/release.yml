@@ -16,9 +16,10 @@ jobs:
       - name: Build universal binary
         run: |
           mkdir -p build dist
-          swiftc -O -target arm64-apple-macos11 src/retry_daemon.swift -o build/retry_daemon_arm64
-          swiftc -O -target x86_64-apple-macos11 src/retry_daemon.swift -o build/retry_daemon_x86_64
+          swiftc -O -target arm64-apple-macos12 src/retry_daemon.swift -o build/retry_daemon_arm64
+          swiftc -O -target x86_64-apple-macos12 src/retry_daemon.swift -o build/retry_daemon_x86_64
           lipo -create build/retry_daemon_arm64 build/retry_daemon_x86_64 -output dist/retry_daemon
+          codesign --force --sign - dist/retry_daemon
           cp bin/codex-retry dist/codex-retry
           chmod +x dist/retry_daemon dist/codex-retry
           tar -czf codex-retry-macos.tar.gz -C dist .
