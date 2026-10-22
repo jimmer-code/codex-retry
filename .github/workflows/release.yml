@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal binary
+        run: |
+          mkdir -p build dist
+          swiftc -O -target arm64-apple-macos11 src/retry_daemon.swift -o build/retry_daemon_arm64
+          swiftc -O -target x86_64-apple-macos11 src/retry_daemon.swift -o build/retry_daemon_x86_64
+          lipo -create build/retry_daemon_arm64 build/retry_daemon_x86_64 -output dist/retry_daemon
+          cp bin/codex-retry dist/codex-retry
+          chmod +x dist/retry_daemon dist/codex-retry
+          tar -czf codex-retry-macos.tar.gz -C dist .
+      - name: Create GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" codex-retry-macos.tar.gz --title "${GITHUB_REF_NAME}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

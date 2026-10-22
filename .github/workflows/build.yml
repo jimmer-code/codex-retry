@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the daemon
+        run: swiftc -O src/retry_daemon.swift -o /tmp/retry_daemon
+      - name: Syntax-check the CLI
+        run: bash -n bin/codex-retry
+      - name: Syntax-check install scripts
+        run: bash -n install.sh && bash -n uninstall.sh

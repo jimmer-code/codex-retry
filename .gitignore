@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# build outputs
+build/
+dist/
+*.log
+
+# developer-only debugging tools (not part of the published package)
+dev/
+
+# internal handoff notes for the next maintainer (not part of the published repo)
+HANDOFF.md
