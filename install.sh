@@ -2,12 +2,12 @@
 # install.sh — install codex-retry.
 #
 # One-liner (downloads the prebuilt universal binary from the latest GitHub release):
-#   curl -fsSL https://raw.githubusercontent.com/jiaweizhang1995/codex-retry/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jimmer-code/codex-retry/main/install.sh | bash
 # From a git checkout (builds from source, needs Xcode Command Line Tools):
 #   ./install.sh
 set -euo pipefail
 
-REPO="${CODEX_RETRY_REPO:-jiaweizhang1995/codex-retry}"
+REPO="${CODEX_RETRY_REPO:-jimmer-code/codex-retry}"
 BRANCH="${CODEX_RETRY_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 RELEASE="https://github.com/${REPO}/releases/latest/download/codex-retry-macos.tar.gz"

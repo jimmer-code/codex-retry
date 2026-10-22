@@ -14,8 +14,8 @@ agent 只能停在那儿等你回来点「重试」。点完过一会儿，又�
 把下面这段话发给 Claude Code、Codex 或你在用的任何 agent：
 
 ```text
-帮我安装 codex-retry（https://github.com/jiaweizhang1995/codex-retry）：
-1. 运行：curl -fsSL https://raw.githubusercontent.com/jiaweizhang1995/codex-retry/main/install.sh | bash
+帮我安装 codex-retry（https://github.com/jimmer-code/codex-retry）：
+1. 运行：curl -fsSL https://raw.githubusercontent.com/jimmer-code/codex-retry/main/install.sh | bash
 2. 运行：~/.local/bin/codex-retry start
 3. 如果提示缺少「辅助功能」权限，请让我给你当前运行所在的 App 打开辅助功能
    （系统设置 → 隐私与安全性 → 辅助功能），等我确认后再执行第 2 步。
@@ -25,7 +25,7 @@ agent 只能停在那儿等你回来点「重试」。点完过一会儿，又�
 ## 或者自己装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jiaweizhang1995/codex-retry/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jimmer-code/codex-retry/main/install.sh | bash
 codex-retry          # 开 / 关
 codex-retry status   # 在不在跑、权限好不好、最近重试记录
 ```

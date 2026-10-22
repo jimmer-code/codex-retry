@@ -15,8 +15,8 @@ its own, so your agent just sits there until you come back and click **Retry**. 
 Paste this into Claude Code, Codex, or whatever agent you use:
 
 ```text
-Install codex-retry for me (https://github.com/jiaweizhang1995/codex-retry):
-1. Run: curl -fsSL https://raw.githubusercontent.com/jiaweizhang1995/codex-retry/main/install.sh | bash
+Install codex-retry for me (https://github.com/jimmer-code/codex-retry):
+1. Run: curl -fsSL https://raw.githubusercontent.com/jimmer-code/codex-retry/main/install.sh | bash
 2. Run: ~/.local/bin/codex-retry start
 3. If it says the Accessibility permission is missing, ask me to enable Accessibility for the app you are
    running in (System Settings → Privacy & Security → Accessibility), wait until I confirm, then run step 2 again.
@@ -26,7 +26,7 @@ Install codex-retry for me (https://github.com/jiaweizhang1995/codex-retry):
 ## Or do it yourself
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jiaweizhang1995/codex-retry/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jimmer-code/codex-retry/main/install.sh | bash
 codex-retry          # on / off toggle
 codex-retry status   # is it running? permissions OK? recent retries
 ```
